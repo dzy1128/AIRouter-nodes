@@ -91,6 +91,56 @@ def _normalize_data_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
+def _collect_image_items(payload: Any) -> List[Dict[str, Any]]:
+    image_items: List[Dict[str, Any]] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if any(
+                key in node and isinstance(node.get(key), str) and node.get(key)
+                for key in ("base64", "b64_json", "bytes", "url", "image")
+            ):
+                image_items.append(node)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(payload)
+    return image_items
+
+
+def _summarize_response_payload(payload: Any) -> List[str]:
+    lines: List[str] = []
+
+    if isinstance(payload, dict):
+        top_keys = ", ".join(sorted(str(key) for key in payload.keys())[:20])
+        if top_keys:
+            lines.append(f"响应顶层字段: {top_keys}")
+
+        data = payload.get("data")
+        if isinstance(data, list):
+            lines.append(f"data 数量: {len(data)}")
+            if data and isinstance(data[0], dict):
+                item_keys = ", ".join(sorted(str(key) for key in data[0].keys())[:20])
+                if item_keys:
+                    lines.append(f"data[0] 字段: {item_keys}")
+        elif isinstance(data, dict):
+            item_keys = ", ".join(sorted(str(key) for key in data.keys())[:20])
+            if item_keys:
+                lines.append(f"data 字段: {item_keys}")
+
+    image_items = _collect_image_items(payload)
+    lines.append(f"递归检测到图片候选数: {len(image_items)}")
+    if image_items:
+        first_item_keys = ", ".join(sorted(str(key) for key in image_items[0].keys())[:20])
+        if first_item_keys:
+            lines.append(f"首个图片候选字段: {first_item_keys}")
+
+    return lines
+
+
 def _get_api_key() -> str:
     for env_name in ("AIROUTER-API-KEY", "AIROUTER_API_KEY"):
         value = os.environ.get(env_name, "").strip()
@@ -255,7 +305,13 @@ class AIRouterImageBase:
                 "如果你的环境使用下划线命名，也支持 AIROUTER_API_KEY。"
             )
 
-        url = f"{base_url.rstrip('/')}/v1/images/generations"
+        cleaned_base_url = base_url.strip()
+        if not cleaned_base_url:
+            raise RuntimeError("base_url 不能为空。")
+        if "://" not in cleaned_base_url:
+            cleaned_base_url = f"https://{cleaned_base_url}"
+
+        url = f"{cleaned_base_url.rstrip('/')}/v1/images/generations"
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -266,7 +322,7 @@ class AIRouterImageBase:
             url,
             json=payload,
             headers=headers,
-            timeout=timeout_seconds,
+            timeout=(30, timeout_seconds),
         )
         elapsed = time.time() - start_time
 
@@ -312,7 +368,7 @@ class AIRouterImageBase:
 
             url_value = item.get("url")
             if image_bytes is None and isinstance(url_value, str) and url_value:
-                response = requests.get(url_value, timeout=timeout_seconds)
+                response = requests.get(url_value.strip(), timeout=(30, timeout_seconds))
                 response.raise_for_status()
                 image_bytes = response.content
 
@@ -339,6 +395,7 @@ class AIRouterImageBase:
         output_count: int,
         output_resolution: Optional[str],
         texts: Sequence[str],
+        response_summary: Optional[Sequence[str]] = None,
         error: Optional[str] = None,
     ) -> str:
         lines = [
@@ -365,6 +422,11 @@ class AIRouterImageBase:
             lines.append("")
             lines.append("接口文本:")
             lines.extend(texts[:5])
+
+        if response_summary:
+            lines.append("")
+            lines.append("响应摘要:")
+            lines.extend(response_summary[:8])
 
         if error:
             lines.append("")
@@ -433,7 +495,10 @@ class AIRouterImageBase:
                 base_url=base_url,
                 timeout_seconds=timeout_seconds,
             )
+            response_summary = _summarize_response_payload(response_payload)
             data_items = _normalize_data_items(response_payload)
+            if not data_items:
+                data_items = _collect_image_items(response_payload)
             tensors, decode_seconds = self._decode_images(
                 data_items=data_items,
                 timeout_seconds=timeout_seconds,
@@ -454,6 +519,7 @@ class AIRouterImageBase:
                     output_count=0,
                     output_resolution=None,
                     texts=texts,
+                    response_summary=response_summary,
                     error="接口没有返回可解析的图片数据。",
                 )
                 return _placeholder_image(), log
@@ -473,6 +539,7 @@ class AIRouterImageBase:
                 output_count=batch.shape[0],
                 output_resolution=f"{width}x{height}",
                 texts=texts,
+                response_summary=response_summary,
             )
             return batch, log
         except Exception as exc:
