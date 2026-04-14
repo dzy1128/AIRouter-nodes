@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -193,6 +194,64 @@ def _get_api_key() -> str:
 
 def _is_gemini_model(model: str) -> bool:
     return model.strip().lower().startswith("gemini")
+
+
+def _validate_request_params(
+    *,
+    model: str,
+    aspect_ratio: str,
+    image_size: str,
+    response_format: str,
+    temperature: float,
+    top_p: float,
+    max_output_tokens: int,
+    timeout_seconds: int,
+    base_url: str,
+    seed: int,
+    input_image_count: int,
+) -> Optional[str]:
+    if not model.strip():
+        return "非法参数 model：模型名不能为空。"
+    if aspect_ratio not in ASPECT_RATIO_OPTIONS:
+        return f"非法参数 aspect_ratio：{aspect_ratio}，可选值：{', '.join(ASPECT_RATIO_OPTIONS)}。"
+    if image_size not in IMAGE_SIZE_OPTIONS:
+        return f"非法参数 image_size：{image_size}，可选值：{', '.join(IMAGE_SIZE_OPTIONS)}。"
+    if response_format.strip() not in ("url", "base64", "bytes", "json", ""):
+        return f"非法参数 response_format：{response_format}。"
+    if not (0.0 <= float(temperature) <= 2.0):
+        return f"非法参数 temperature：{temperature}，范围应为 0.0 到 2.0。"
+    if not (0.0 <= float(top_p) <= 1.0):
+        return f"非法参数 top_p：{top_p}，范围应为 0.0 到 1.0。"
+    if not (1 <= int(max_output_tokens) <= 262144):
+        return f"非法参数 max_output_tokens：{max_output_tokens}，范围应为 1 到 262144。"
+    if not (10 <= int(timeout_seconds) <= 600):
+        return f"非法参数 timeout_seconds：{timeout_seconds}，范围应为 10 到 600。"
+    if not base_url.strip():
+        return "非法参数 base_url：不能为空。"
+    if not (0 <= int(seed) <= 0xFFFFFFFFFFFFFFFF):
+        return f"非法参数 seed：{seed}，范围应为 0 到 18446744073709551615。"
+    if input_image_count < 0 or input_image_count > 5:
+        return f"非法参数 输入图片数量：{input_image_count}，允许范围为 0 到 5。"
+    return None
+
+
+def _extract_invalid_field_hint(message: str) -> str:
+    if not message:
+        return ""
+
+    patterns = [
+        r"Invalid value at '([^']+)'",
+        r"invalid value at '([^']+)'",
+        r"Field '([^']+)'",
+        r"field '([^']+)'",
+        r"parameter '([^']+)'",
+        r"参数[:：]\s*([A-Za-z0-9_.\[\]-]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, message)
+        if match:
+            return f"非法参数 {match.group(1)}"
+    return ""
 
 
 class AIRouterImageBase:
@@ -423,6 +482,9 @@ class AIRouterImageBase:
 
         if response.status_code != 200:
             message = response_payload.get("msg") or response_payload.get("message") or str(response_payload)
+            hint = _extract_invalid_field_hint(message)
+            if hint:
+                message = f"{message} ({hint})"
             raise RuntimeError(f"接口请求失败，HTTP {response.status_code}: {message}")
 
         code = response_payload.get("code")
@@ -478,6 +540,9 @@ class AIRouterImageBase:
             message = response_payload.get("error", {}).get("message") if isinstance(response_payload, dict) else None
             if not message and isinstance(response_payload, dict):
                 message = response_payload.get("msg") or response_payload.get("message") or str(response_payload)
+            hint = _extract_invalid_field_hint(message or "")
+            if hint:
+                message = f"{message} ({hint})"
             raise RuntimeError(f"Gemini 接口请求失败，HTTP {response.status_code}: {message}")
 
         return response_payload, elapsed
@@ -561,34 +626,8 @@ class AIRouterImageBase:
             f"模式: {'图生图' if input_image_count else '文生图'}",
             f"输入图像数: {input_image_count}",
             f"输出图像数: {output_count}",
-            f"宽高比: {aspect_ratio}",
-            f"输出尺寸档位: {image_size}",
-            f"返回格式: {response_format}",
-            f"Seed: {seed}",
+            f"耗时: API {api_seconds:.2f}s | 解码 {decode_seconds:.2f}s",
         ]
-
-        if prompt.strip():
-            lines.append(f"提示词: {prompt.strip()}")
-
-        if output_resolution:
-            lines.append(f"输出分辨率: {output_resolution}")
-
-        lines.append(f"耗时: API {api_seconds:.2f}s | 解码 {decode_seconds:.2f}s")
-
-        if texts:
-            lines.append("")
-            lines.append("接口文本:")
-            lines.extend(texts[:5])
-
-        if response_summary:
-            lines.append("")
-            lines.append("响应摘要:")
-            lines.extend(response_summary[:8])
-
-        if response_body:
-            lines.append("")
-            lines.append("完整响应体:")
-            lines.extend(response_body.splitlines())
 
         if error:
             lines.append("")
@@ -640,6 +679,39 @@ class AIRouterImageBase:
             )
             return _placeholder_image(), log
 
+        validation_error = _validate_request_params(
+            model=model,
+            aspect_ratio=aspect_ratio,
+            image_size=image_size,
+            response_format=response_format,
+            temperature=temperature,
+            top_p=top_p,
+            max_output_tokens=max_output_tokens,
+            timeout_seconds=timeout_seconds,
+            base_url=base_url,
+            seed=seed,
+            input_image_count=len(input_images),
+        )
+        if validation_error:
+            log = self._format_log(
+                model=model,
+                prompt=prompt,
+                aspect_ratio=aspect_ratio,
+                image_size=image_size,
+                response_format=response_format,
+                seed=seed,
+                input_image_count=len(input_images),
+                api_seconds=0.0,
+                decode_seconds=0.0,
+                output_count=0,
+                output_resolution=None,
+                texts=[],
+                response_summary=None,
+                response_body=None,
+                error=validation_error,
+            )
+            return _placeholder_image(), log
+
         try:
             is_gemini = _is_gemini_model(model)
             if is_gemini:
@@ -678,8 +750,6 @@ class AIRouterImageBase:
                     timeout_seconds=timeout_seconds,
                 )
 
-            response_summary = _summarize_response_payload(response_payload)
-            response_body = _format_response_body(response_payload)
             data_items = _collect_image_items(response_payload)
             if not is_gemini:
                 normalized_data_items = _normalize_data_items(response_payload)
@@ -705,8 +775,6 @@ class AIRouterImageBase:
                     output_count=0,
                     output_resolution=None,
                     texts=texts,
-                    response_summary=response_summary,
-                    response_body=response_body,
                     error="接口没有返回可解析的图片数据。",
                 )
                 return _placeholder_image(), log
@@ -726,8 +794,6 @@ class AIRouterImageBase:
                 output_count=batch.shape[0],
                 output_resolution=f"{width}x{height}",
                 texts=texts,
-                response_summary=response_summary,
-                response_body=response_body,
             )
             return batch, log
         except Exception as exc:
@@ -744,7 +810,6 @@ class AIRouterImageBase:
                 output_count=0,
                 output_resolution=None,
                 texts=[],
-                response_body=None,
                 error=str(exc),
             )
             return _placeholder_image(), log
