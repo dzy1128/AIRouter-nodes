@@ -1,5 +1,6 @@
 import base64
 import io
+import json
 import os
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -68,6 +69,13 @@ def _decode_base64_payload(payload: str) -> bytes:
     return base64.b64decode(payload)
 
 
+def _format_response_body(payload: Any) -> str:
+    try:
+        return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        return str(payload)
+
+
 def _extract_texts(payload: Any) -> List[str]:
     texts: List[str] = []
     if isinstance(payload, dict):
@@ -93,12 +101,25 @@ def _normalize_data_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _collect_image_items(payload: Any) -> List[Dict[str, Any]]:
     image_items: List[Dict[str, Any]] = []
+    candidate_string_keys = (
+        "base64",
+        "b64_json",
+        "bytes",
+        "url",
+        "image",
+        "data",
+        "image_url",
+        "imageUrl",
+        "uri",
+        "image_uri",
+        "imageUri",
+    )
 
     def walk(node: Any) -> None:
         if isinstance(node, dict):
             if any(
                 key in node and isinstance(node.get(key), str) and node.get(key)
-                for key in ("base64", "b64_json", "bytes", "url", "image")
+                for key in candidate_string_keys
             ):
                 image_items.append(node)
             for value in node.values():
@@ -109,6 +130,16 @@ def _collect_image_items(payload: Any) -> List[Dict[str, Any]]:
 
     walk(payload)
     return image_items
+
+
+def _get_nested_inline_data(node: Dict[str, Any]) -> Optional[str]:
+    for key in ("inline_data", "inlineData"):
+        value = node.get(key)
+        if isinstance(value, dict):
+            data_value = value.get("data") or value.get("base64") or value.get("b64_json")
+            if isinstance(data_value, str) and data_value:
+                return data_value
+    return None
 
 
 def _summarize_response_payload(payload: Any) -> List[str]:
@@ -358,15 +389,33 @@ class AIRouterImageBase:
 
             image_bytes: Optional[bytes] = None
 
-            base64_value = item.get("base64") or item.get("b64_json") or item.get("image")
+            inline_data_value = _get_nested_inline_data(item)
+            if isinstance(inline_data_value, str) and inline_data_value:
+                try:
+                    image_bytes = _decode_base64_payload(inline_data_value)
+                except Exception:
+                    image_bytes = None
+
+            base64_value = (
+                item.get("base64")
+                or item.get("b64_json")
+                or item.get("image")
+                or item.get("data")
+            )
             if isinstance(base64_value, str) and base64_value:
-                image_bytes = _decode_base64_payload(base64_value)
+                try:
+                    image_bytes = _decode_base64_payload(base64_value)
+                except Exception:
+                    image_bytes = None
 
             bytes_value = item.get("bytes")
             if image_bytes is None and isinstance(bytes_value, str) and bytes_value:
-                image_bytes = _decode_base64_payload(bytes_value)
+                try:
+                    image_bytes = _decode_base64_payload(bytes_value)
+                except Exception:
+                    image_bytes = None
 
-            url_value = item.get("url")
+            url_value = item.get("url") or item.get("uri") or item.get("image_url") or item.get("imageUrl")
             if image_bytes is None and isinstance(url_value, str) and url_value:
                 response = requests.get(url_value.strip(), timeout=(30, timeout_seconds))
                 response.raise_for_status()
@@ -396,6 +445,7 @@ class AIRouterImageBase:
         output_resolution: Optional[str],
         texts: Sequence[str],
         response_summary: Optional[Sequence[str]] = None,
+        response_body: Optional[str] = None,
         error: Optional[str] = None,
     ) -> str:
         lines = [
@@ -427,6 +477,11 @@ class AIRouterImageBase:
             lines.append("")
             lines.append("响应摘要:")
             lines.extend(response_summary[:8])
+
+        if response_body:
+            lines.append("")
+            lines.append("完整响应体:")
+            lines.extend(response_body.splitlines())
 
         if error:
             lines.append("")
@@ -496,6 +551,7 @@ class AIRouterImageBase:
                 timeout_seconds=timeout_seconds,
             )
             response_summary = _summarize_response_payload(response_payload)
+            response_body = _format_response_body(response_payload)
             data_items = _normalize_data_items(response_payload)
             if not data_items:
                 data_items = _collect_image_items(response_payload)
@@ -520,6 +576,7 @@ class AIRouterImageBase:
                     output_resolution=None,
                     texts=texts,
                     response_summary=response_summary,
+                    response_body=response_body,
                     error="接口没有返回可解析的图片数据。",
                 )
                 return _placeholder_image(), log
@@ -540,6 +597,7 @@ class AIRouterImageBase:
                 output_resolution=f"{width}x{height}",
                 texts=texts,
                 response_summary=response_summary,
+                response_body=response_body,
             )
             return batch, log
         except Exception as exc:
@@ -556,6 +614,7 @@ class AIRouterImageBase:
                 output_count=0,
                 output_resolution=None,
                 texts=[],
+                response_body=None,
                 error=str(exc),
             )
             return _placeholder_image(), log
