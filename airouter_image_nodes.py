@@ -63,6 +63,17 @@ def _tensor_to_data_url(image: torch.Tensor) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
+def _tensor_to_inline_data(image: torch.Tensor) -> Dict[str, str]:
+    pil_image = _tensor_to_pil(image)
+    buffer = io.BytesIO()
+    pil_image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return {
+        "mimeType": "image/png",
+        "data": encoded,
+    }
+
+
 def _decode_base64_payload(payload: str) -> bytes:
     if payload.startswith("data:") and ";base64," in payload:
         payload = payload.split(";base64,", 1)[1]
@@ -178,6 +189,10 @@ def _get_api_key() -> str:
         if value:
             return value
     return ""
+
+
+def _is_gemini_model(model: str) -> bool:
+    return model.strip().lower().startswith("gemini")
 
 
 class AIRouterImageBase:
@@ -323,6 +338,48 @@ class AIRouterImageBase:
             "format": response_format.strip(),
         }
 
+    def _build_gemini_payload(
+        self,
+        prompt: str,
+        model: str,
+        aspect_ratio: str,
+        image_size: str,
+        temperature: float,
+        top_p: float,
+        max_output_tokens: int,
+        seed: int,
+        input_images: Sequence[torch.Tensor],
+    ) -> Dict[str, Any]:
+        parts: List[Dict[str, Any]] = []
+        if prompt.strip():
+            parts.append({"text": prompt.strip()})
+        for image in input_images:
+            parts.append({"inlineData": _tensor_to_inline_data(image)})
+
+        payload: Dict[str, Any] = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": parts or [{"text": ""}],
+                }
+            ],
+            "generationConfig": {
+                "temperature": temperature,
+                "topP": top_p,
+                "maxOutputTokens": max_output_tokens,
+                "responseModalities": ["IMAGE"],
+                "imageConfig": {
+                    "aspectRatio": aspect_ratio,
+                    "imageSize": image_size,
+                },
+            },
+        }
+
+        if seed:
+            payload["generationConfig"]["seed"] = seed
+
+        return payload
+
     def _request_images(
         self,
         payload: Dict[str, Any],
@@ -372,6 +429,56 @@ class AIRouterImageBase:
         if code not in (None, 200, "200"):
             message = response_payload.get("msg") or response_payload.get("message") or str(response_payload)
             raise RuntimeError(f"接口返回异常 code={code}: {message}")
+
+        return response_payload, elapsed
+
+    def _request_gemini_images(
+        self,
+        payload: Dict[str, Any],
+        base_url: str,
+        timeout_seconds: int,
+        model: str,
+    ) -> Tuple[Dict[str, Any], float]:
+        api_key = _get_api_key()
+        if not api_key:
+            raise RuntimeError(
+                "未检测到环境变量 AIROUTER-API-KEY。"
+                "如果你的环境使用下划线命名，也支持 AIROUTER_API_KEY。"
+            )
+
+        cleaned_base_url = base_url.strip()
+        if not cleaned_base_url:
+            raise RuntimeError("base_url 不能为空。")
+        if "://" not in cleaned_base_url:
+            cleaned_base_url = f"https://{cleaned_base_url}"
+
+        url = f"{cleaned_base_url.rstrip('/')}/v1beta/models/{model.strip()}:generateContent"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        start_time = time.time()
+        response = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=(30, timeout_seconds),
+        )
+        elapsed = time.time() - start_time
+
+        try:
+            response_payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"接口返回了非 JSON 内容，HTTP {response.status_code}，响应片段：{response.text[:300]}"
+            ) from exc
+
+        if response.status_code != 200:
+            message = response_payload.get("error", {}).get("message") if isinstance(response_payload, dict) else None
+            if not message and isinstance(response_payload, dict):
+                message = response_payload.get("msg") or response_payload.get("message") or str(response_payload)
+            raise RuntimeError(f"Gemini 接口请求失败，HTTP {response.status_code}: {message}")
 
         return response_payload, elapsed
 
@@ -534,27 +641,50 @@ class AIRouterImageBase:
             return _placeholder_image(), log
 
         try:
-            payload = self._build_payload(
-                prompt=prompt,
-                model=model,
-                aspect_ratio=aspect_ratio,
-                image_size=image_size,
-                response_format=response_format,
-                temperature=temperature,
-                top_p=top_p,
-                max_output_tokens=max_output_tokens,
-                input_images=input_images,
-            )
-            response_payload, api_seconds = self._request_images(
-                payload=payload,
-                base_url=base_url,
-                timeout_seconds=timeout_seconds,
-            )
+            is_gemini = _is_gemini_model(model)
+            if is_gemini:
+                payload = self._build_gemini_payload(
+                    prompt=prompt,
+                    model=model,
+                    aspect_ratio=aspect_ratio,
+                    image_size=image_size,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_output_tokens=max_output_tokens,
+                    seed=seed,
+                    input_images=input_images,
+                )
+                response_payload, api_seconds = self._request_gemini_images(
+                    payload=payload,
+                    base_url=base_url,
+                    timeout_seconds=timeout_seconds,
+                    model=model,
+                )
+            else:
+                payload = self._build_payload(
+                    prompt=prompt,
+                    model=model,
+                    aspect_ratio=aspect_ratio,
+                    image_size=image_size,
+                    response_format=response_format,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_output_tokens=max_output_tokens,
+                    input_images=input_images,
+                )
+                response_payload, api_seconds = self._request_images(
+                    payload=payload,
+                    base_url=base_url,
+                    timeout_seconds=timeout_seconds,
+                )
+
             response_summary = _summarize_response_payload(response_payload)
             response_body = _format_response_body(response_payload)
-            data_items = _normalize_data_items(response_payload)
-            if not data_items:
-                data_items = _collect_image_items(response_payload)
+            data_items = _collect_image_items(response_payload)
+            if not is_gemini:
+                normalized_data_items = _normalize_data_items(response_payload)
+                if normalized_data_items:
+                    data_items = normalized_data_items + [item for item in data_items if item not in normalized_data_items]
             tensors, decode_seconds = self._decode_images(
                 data_items=data_items,
                 timeout_seconds=timeout_seconds,

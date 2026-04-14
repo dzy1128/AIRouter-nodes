@@ -36,4 +36,6 @@
 - `response_format`
 - `base_url`
 
+其中 Gemini 模型会自动切换到原生 `generateContent` 请求，并从 `inlineData` 中提取图片；普通模型继续走通用图片生成接口。
+
 如果你后续拿到文档里的精确字段枚举，可以继续把模型列表和参数选项收紧成下拉框。
