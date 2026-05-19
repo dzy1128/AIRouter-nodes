@@ -62,13 +62,6 @@ SEQUENTIAL_IMAGE_GENERATION_OPTIONS = [
 SEEDREAM_MODEL_UNSUPPORTED_PARAMS: Dict[str, frozenset] = {
     "doubao-seedream-5-0-260128": frozenset(
         {
-            "guidance_scale",
-            "sequential_image_generation",
-            "sequential_image_generation_options",
-        }
-    ),
-    "seedream-5.0-lite": frozenset(
-        {
             "sequential_image_generation",
             "sequential_image_generation_options",
         }
@@ -109,17 +102,6 @@ def _tensor_to_data_url(image: torch.Tensor) -> str:
     pil_image.save(buffer, format="PNG")
     encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
     return f"data:image/png;base64,{encoded}"
-
-
-def _tensor_to_inline_data(image: torch.Tensor) -> Dict[str, str]:
-    pil_image = _tensor_to_pil(image)
-    buffer = io.BytesIO()
-    pil_image.save(buffer, format="PNG")
-    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
-    return {
-        "mimeType": "image/png",
-        "data": encoded,
-    }
 
 
 def _decode_base64_payload(payload: str) -> bytes:
@@ -256,10 +238,6 @@ def _join_endpoint(base_url: str, endpoint_path: str) -> str:
     return f"{base}{suffix}"
 
 
-def _is_gemini_model(model: str) -> bool:
-    return model.strip().lower().startswith("gemini")
-
-
 def _validate_request_params(
     *,
     model: str,
@@ -314,7 +292,6 @@ def _validate_seedream_params(
     model: str,
     size: str,
     seed: int,
-    guidance_scale: float,
     sequential_image_generation: str,
     max_images: int,
     response_format: str,
@@ -331,10 +308,6 @@ def _validate_seedream_params(
         )
     if response_format.strip() not in ("url", "base64", "bytes", "json", ""):
         return f"非法参数 response_format：{response_format}。"
-    if _seedream_supports_param(model, "guidance_scale") and not (
-        1.0 <= float(guidance_scale) <= 10.0
-    ):
-        return f"非法参数 guidance_scale：{guidance_scale}，范围应为 1.0 到 10.0。"
     if not (10 <= int(timeout_seconds) <= 600):
         return f"非法参数 timeout_seconds：{timeout_seconds}，范围应为 10 到 600。"
     if not base_url.strip():
@@ -532,48 +505,6 @@ class AIRouterImageBase:
             "format": response_format.strip(),
         }
 
-    def _build_gemini_payload(
-        self,
-        prompt: str,
-        model: str,
-        aspect_ratio: str,
-        image_size: str,
-        temperature: float,
-        top_p: float,
-        max_output_tokens: int,
-        seed: int,
-        input_images: Sequence[torch.Tensor],
-    ) -> Dict[str, Any]:
-        parts: List[Dict[str, Any]] = []
-        if prompt.strip():
-            parts.append({"text": prompt.strip()})
-        for image in input_images:
-            parts.append({"inlineData": _tensor_to_inline_data(image)})
-
-        payload: Dict[str, Any] = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": parts or [{"text": ""}],
-                }
-            ],
-            "generationConfig": {
-                "temperature": temperature,
-                "topP": top_p,
-                "maxOutputTokens": max_output_tokens,
-                "responseModalities": ["IMAGE"],
-                "imageConfig": {
-                    "aspectRatio": aspect_ratio,
-                    "imageSize": image_size,
-                },
-            },
-        }
-
-        if seed:
-            payload["generationConfig"]["seed"] = seed
-
-        return payload
-
     def _request_images(
         self,
         payload: Dict[str, Any],
@@ -623,57 +554,6 @@ class AIRouterImageBase:
         if code not in (None, 200, "200"):
             message = response_payload.get("msg") or response_payload.get("message") or str(response_payload)
             raise RuntimeError(f"接口返回异常 code={code}: {message}")
-
-        return response_payload, elapsed
-
-    def _request_gemini_images(
-        self,
-        payload: Dict[str, Any],
-        base_url: str,
-        timeout_seconds: int,
-        model: str,
-    ) -> Tuple[Dict[str, Any], float]:
-        api_key = _get_api_key()
-        if not api_key:
-            raise RuntimeError(
-                "未检测到环境变量 AIROUTER-API-KEY。"
-                "如果你的环境使用下划线命名，也支持 AIROUTER_API_KEY。"
-            )
-
-        endpoint = f"/v1beta/models/{model.strip()}:generateContent"
-        url = _join_endpoint(base_url, endpoint)
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-        start_time = time.time()
-        response = requests.post(
-            url,
-            json=payload,
-            headers=headers,
-            timeout=(30, timeout_seconds),
-        )
-        elapsed = time.time() - start_time
-
-        try:
-            response_payload = response.json()
-        except ValueError as exc:
-            raise RuntimeError(
-                f"接口返回了非 JSON 内容，HTTP {response.status_code}，"
-                f"请求 URL: {url}，响应片段：{response.text[:300]}"
-            ) from exc
-
-        if response.status_code != 200:
-            message = response_payload.get("error", {}).get("message") if isinstance(response_payload, dict) else None
-            if not message and isinstance(response_payload, dict):
-                message = response_payload.get("msg") or response_payload.get("message") or str(response_payload)
-            hint = _extract_invalid_field_hint(message or "")
-            if hint:
-                message = f"{message} ({hint})"
-            raise RuntimeError(
-                f"Gemini 接口请求失败，HTTP {response.status_code}，请求 URL: {url}：{message}"
-            )
 
         return response_payload, elapsed
 
@@ -818,48 +698,29 @@ class AIRouterImageBase:
             return _placeholder_image(), log
 
         try:
-            is_gemini = _is_gemini_model(model)
-            if is_gemini:
-                payload = self._build_gemini_payload(
-                    prompt=prompt,
-                    model=model,
-                    aspect_ratio=aspect_ratio,
-                    image_size=image_size,
-                    temperature=temperature,
-                    top_p=top_p,
-                    max_output_tokens=max_output_tokens,
-                    seed=seed,
-                    input_images=input_images,
-                )
-                response_payload, api_seconds = self._request_gemini_images(
-                    payload=payload,
-                    base_url=base_url,
-                    timeout_seconds=timeout_seconds,
-                    model=model,
-                )
-            else:
-                payload = self._build_payload(
-                    prompt=prompt,
-                    model=model,
-                    aspect_ratio=aspect_ratio,
-                    image_size=image_size,
-                    response_format=response_format,
-                    temperature=temperature,
-                    top_p=top_p,
-                    max_output_tokens=max_output_tokens,
-                    input_images=input_images,
-                )
-                response_payload, api_seconds = self._request_images(
-                    payload=payload,
-                    base_url=base_url,
-                    timeout_seconds=timeout_seconds,
-                )
+            payload = self._build_payload(
+                prompt=prompt,
+                model=model,
+                aspect_ratio=aspect_ratio,
+                image_size=image_size,
+                response_format=response_format,
+                temperature=temperature,
+                top_p=top_p,
+                max_output_tokens=max_output_tokens,
+                input_images=input_images,
+            )
+            response_payload, api_seconds = self._request_images(
+                payload=payload,
+                base_url=base_url,
+                timeout_seconds=timeout_seconds,
+            )
 
             data_items = _collect_image_items(response_payload)
-            if not is_gemini:
-                normalized_data_items = _normalize_data_items(response_payload)
-                if normalized_data_items:
-                    data_items = normalized_data_items + [item for item in data_items if item not in normalized_data_items]
+            normalized_data_items = _normalize_data_items(response_payload)
+            if normalized_data_items:
+                data_items = normalized_data_items + [
+                    item for item in data_items if item not in normalized_data_items
+                ]
             tensors, decode_seconds = self._decode_images(
                 data_items=data_items,
                 timeout_seconds=timeout_seconds,
@@ -901,7 +762,6 @@ class AIRouterSeedreamImageNode(AIRouterImageBase):
     NODE_TITLE = "AIRouter Seedream"
     MODEL_OPTIONS = [
         "doubao-seedream-5-0-260128",
-        "seedream-5.0-lite",
     ]
     DEFAULT_MODEL = "doubao-seedream-5-0-260128"
 
@@ -929,15 +789,6 @@ class AIRouterSeedreamImageNode(AIRouterImageBase):
                 "size": (
                     SEEDREAM_SIZE_OPTIONS,
                     {"default": "2048x2048"},
-                ),
-                "guidance_scale": (
-                    "FLOAT",
-                    {
-                        "default": 2.5,
-                        "min": 1.0,
-                        "max": 10.0,
-                        "step": 0.1,
-                    },
                 ),
                 "watermark": (
                     "BOOLEAN",
@@ -1005,7 +856,6 @@ class AIRouterSeedreamImageNode(AIRouterImageBase):
         model: str,
         size: str,
         seed: int,
-        guidance_scale: float,
         watermark: bool,
         sequential_image_generation: str,
         max_images: int,
@@ -1023,8 +873,6 @@ class AIRouterSeedreamImageNode(AIRouterImageBase):
             "seed": int(seed),
             "watermark": bool(watermark),
         }
-        if _seedream_supports_param(model, "guidance_scale"):
-            parameters["guidance_scale"] = float(guidance_scale)
         if _seedream_supports_param(model, "sequential_image_generation"):
             parameters["sequential_image_generation"] = sequential_image_generation
             if sequential_image_generation == "auto":
@@ -1044,7 +892,6 @@ class AIRouterSeedreamImageNode(AIRouterImageBase):
         prompt: str,
         model: str,
         size: str,
-        guidance_scale: float,
         watermark: bool,
         sequential_image_generation: str,
         max_images: int,
@@ -1079,7 +926,6 @@ class AIRouterSeedreamImageNode(AIRouterImageBase):
             model=model,
             size=size,
             seed=seed,
-            guidance_scale=guidance_scale,
             sequential_image_generation=sequential_image_generation,
             max_images=max_images,
             response_format=response_format,
@@ -1104,7 +950,6 @@ class AIRouterSeedreamImageNode(AIRouterImageBase):
                 model=model,
                 size=size,
                 seed=seed,
-                guidance_scale=guidance_scale,
                 watermark=watermark,
                 sequential_image_generation=sequential_image_generation,
                 max_images=max_images,
@@ -1160,19 +1005,11 @@ class AIRouterSeedreamImageNode(AIRouterImageBase):
             )
             return _placeholder_image(), log
 
-
-class AIRouterGeminiImageNode(AIRouterImageBase):
-    NODE_TITLE = "AIRouter Gemini"
-    DEFAULT_MODEL = "gemini-3.1-flash-image-preview-c"
-
-
 NODE_CLASS_MAPPINGS = {
     "AIRouterSeedreamImageNode": AIRouterSeedreamImageNode,
-    "AIRouterGeminiImageNode": AIRouterGeminiImageNode,
 }
 
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AIRouterSeedreamImageNode": "AIRouter Seedream Image",
-    "AIRouterGeminiImageNode": "AIRouter Gemini Image",
 }
