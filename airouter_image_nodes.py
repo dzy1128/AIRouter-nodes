@@ -58,6 +58,28 @@ SEQUENTIAL_IMAGE_GENERATION_OPTIONS = [
     "auto",
 ]
 
+# 各模型支持的 parameters 字段（未列出的字段默认支持）
+SEEDREAM_MODEL_UNSUPPORTED_PARAMS: Dict[str, frozenset] = {
+    "doubao-seedream-5-0-260128": frozenset(
+        {
+            "guidance_scale",
+            "sequential_image_generation",
+            "sequential_image_generation_options",
+        }
+    ),
+    "seedream-5.0-lite": frozenset(
+        {
+            "sequential_image_generation",
+            "sequential_image_generation_options",
+        }
+    ),
+}
+
+
+def _seedream_supports_param(model: str, param: str) -> bool:
+    unsupported = SEEDREAM_MODEL_UNSUPPORTED_PARAMS.get(model.strip(), frozenset())
+    return param not in unsupported
+
 
 def _placeholder_image(size: int = 512) -> torch.Tensor:
     return torch.zeros((1, size, size, 3), dtype=torch.float32)
@@ -217,6 +239,23 @@ def _get_api_key() -> str:
     return ""
 
 
+def _normalize_base_url(base_url: str) -> str:
+    cleaned = base_url.strip()
+    if not cleaned:
+        raise RuntimeError("base_url 不能为空。")
+    if "://" not in cleaned:
+        cleaned = f"https://{cleaned}"
+    return cleaned.rstrip("/")
+
+
+def _join_endpoint(base_url: str, endpoint_path: str) -> str:
+    base = _normalize_base_url(base_url)
+    suffix = "/" + endpoint_path.strip("/")
+    if base.endswith(suffix):
+        return base
+    return f"{base}{suffix}"
+
+
 def _is_gemini_model(model: str) -> bool:
     return model.strip().lower().startswith("gemini")
 
@@ -292,7 +331,9 @@ def _validate_seedream_params(
         )
     if response_format.strip() not in ("url", "base64", "bytes", "json", ""):
         return f"非法参数 response_format：{response_format}。"
-    if not (1.0 <= float(guidance_scale) <= 10.0):
+    if _seedream_supports_param(model, "guidance_scale") and not (
+        1.0 <= float(guidance_scale) <= 10.0
+    ):
         return f"非法参数 guidance_scale：{guidance_scale}，范围应为 1.0 到 10.0。"
     if not (10 <= int(timeout_seconds) <= 600):
         return f"非法参数 timeout_seconds：{timeout_seconds}，范围应为 10 到 600。"
@@ -300,13 +341,14 @@ def _validate_seedream_params(
         return "非法参数 base_url：不能为空。"
     if not (-1 <= int(seed) <= 2147483647):
         return f"非法参数 seed：{seed}，范围应为 -1 到 2147483647。"
-    if sequential_image_generation not in SEQUENTIAL_IMAGE_GENERATION_OPTIONS:
-        return (
-            f"非法参数 sequential_image_generation：{sequential_image_generation}，"
-            f"可选值：{', '.join(SEQUENTIAL_IMAGE_GENERATION_OPTIONS)}。"
-        )
-    if not (1 <= int(max_images) <= 15):
-        return f"非法参数 max_images：{max_images}，范围应为 1 到 15。"
+    if _seedream_supports_param(model, "sequential_image_generation"):
+        if sequential_image_generation not in SEQUENTIAL_IMAGE_GENERATION_OPTIONS:
+            return (
+                f"非法参数 sequential_image_generation：{sequential_image_generation}，"
+                f"可选值：{', '.join(SEQUENTIAL_IMAGE_GENERATION_OPTIONS)}。"
+            )
+        if not (1 <= int(max_images) <= 15):
+            return f"非法参数 max_images：{max_images}，范围应为 1 到 15。"
     if input_image_count < 0 or input_image_count > 5:
         return f"非法参数 输入图片数量：{input_image_count}，允许范围为 0 到 5。"
     return None
@@ -545,13 +587,7 @@ class AIRouterImageBase:
                 "如果你的环境使用下划线命名，也支持 AIROUTER_API_KEY。"
             )
 
-        cleaned_base_url = base_url.strip()
-        if not cleaned_base_url:
-            raise RuntimeError("base_url 不能为空。")
-        if "://" not in cleaned_base_url:
-            cleaned_base_url = f"https://{cleaned_base_url}"
-
-        url = f"{cleaned_base_url.rstrip('/')}/v1/images/generations"
+        url = _join_endpoint(base_url, "/v1/images/generations")
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -570,7 +606,8 @@ class AIRouterImageBase:
             response_payload = response.json()
         except ValueError as exc:
             raise RuntimeError(
-                f"接口返回了非 JSON 内容，HTTP {response.status_code}，响应片段：{response.text[:300]}"
+                f"接口返回了非 JSON 内容，HTTP {response.status_code}，"
+                f"请求 URL: {url}，响应片段：{response.text[:300]}"
             ) from exc
 
         if response.status_code != 200:
@@ -578,7 +615,9 @@ class AIRouterImageBase:
             hint = _extract_invalid_field_hint(message)
             if hint:
                 message = f"{message} ({hint})"
-            raise RuntimeError(f"接口请求失败，HTTP {response.status_code}: {message}")
+            raise RuntimeError(
+                f"接口请求失败，HTTP {response.status_code}，请求 URL: {url}：{message}"
+            )
 
         code = response_payload.get("code")
         if code not in (None, 200, "200"):
@@ -601,13 +640,8 @@ class AIRouterImageBase:
                 "如果你的环境使用下划线命名，也支持 AIROUTER_API_KEY。"
             )
 
-        cleaned_base_url = base_url.strip()
-        if not cleaned_base_url:
-            raise RuntimeError("base_url 不能为空。")
-        if "://" not in cleaned_base_url:
-            cleaned_base_url = f"https://{cleaned_base_url}"
-
-        url = f"{cleaned_base_url.rstrip('/')}/v1beta/models/{model.strip()}:generateContent"
+        endpoint = f"/v1beta/models/{model.strip()}:generateContent"
+        url = _join_endpoint(base_url, endpoint)
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -626,7 +660,8 @@ class AIRouterImageBase:
             response_payload = response.json()
         except ValueError as exc:
             raise RuntimeError(
-                f"接口返回了非 JSON 内容，HTTP {response.status_code}，响应片段：{response.text[:300]}"
+                f"接口返回了非 JSON 内容，HTTP {response.status_code}，"
+                f"请求 URL: {url}，响应片段：{response.text[:300]}"
             ) from exc
 
         if response.status_code != 200:
@@ -636,7 +671,9 @@ class AIRouterImageBase:
             hint = _extract_invalid_field_hint(message or "")
             if hint:
                 message = f"{message} ({hint})"
-            raise RuntimeError(f"Gemini 接口请求失败，HTTP {response.status_code}: {message}")
+            raise RuntimeError(
+                f"Gemini 接口请求失败，HTTP {response.status_code}，请求 URL: {url}：{message}"
+            )
 
         return response_payload, elapsed
 
@@ -984,14 +1021,16 @@ class AIRouterSeedreamImageNode(AIRouterImageBase):
         parameters: Dict[str, Any] = {
             "size": size,
             "seed": int(seed),
-            "guidance_scale": float(guidance_scale),
             "watermark": bool(watermark),
-            "sequential_image_generation": sequential_image_generation,
         }
-        if sequential_image_generation == "auto":
-            parameters["sequential_image_generation_options"] = {
-                "max_images": int(max_images),
-            }
+        if _seedream_supports_param(model, "guidance_scale"):
+            parameters["guidance_scale"] = float(guidance_scale)
+        if _seedream_supports_param(model, "sequential_image_generation"):
+            parameters["sequential_image_generation"] = sequential_image_generation
+            if sequential_image_generation == "auto":
+                parameters["sequential_image_generation_options"] = {
+                    "max_images": int(max_images),
+                }
 
         return {
             "model": model.strip(),
