@@ -257,9 +257,31 @@ def _extract_invalid_field_hint(message: str) -> str:
 class AIRouterImageBase:
     NODE_TITLE = "AIRouter Image"
     DEFAULT_MODEL = ""
+    MODEL_OPTIONS: Optional[List[str]] = None
 
     @classmethod
     def INPUT_TYPES(cls):
+        if cls.MODEL_OPTIONS:
+            default_model = (
+                cls.DEFAULT_MODEL
+                if cls.DEFAULT_MODEL in cls.MODEL_OPTIONS
+                else cls.MODEL_OPTIONS[0]
+            )
+            model_field = (
+                list(cls.MODEL_OPTIONS),
+                {
+                    "default": default_model,
+                },
+            )
+        else:
+            model_field = (
+                "STRING",
+                {
+                    "default": cls.DEFAULT_MODEL,
+                    "multiline": False,
+                },
+            )
+
         return {
             "required": {
                 "prompt": (
@@ -270,13 +292,7 @@ class AIRouterImageBase:
                         "placeholder": "输入提示词。图生图时可以留空，但建议配合提示词使用。",
                     },
                 ),
-                "model": (
-                    "STRING",
-                    {
-                        "default": cls.DEFAULT_MODEL,
-                        "multiline": False,
-                    },
-                ),
+                "model": model_field,
                 "aspect_ratio": (
                     ASPECT_RATIO_OPTIONS,
                     {
@@ -817,7 +833,11 @@ class AIRouterImageBase:
 
 class AIRouterSeedreamImageNode(AIRouterImageBase):
     NODE_TITLE = "AIRouter Seedream"
-    DEFAULT_MODEL = "seedream-5.0-lite"
+    MODEL_OPTIONS = [
+        "doubao-seedream-5-0-260128",
+        "seedream-5.0-lite",
+    ]
+    DEFAULT_MODEL = "doubao-seedream-5-0-260128"
 
 
 class AIRouterGeminiImageNode(AIRouterImageBase):
