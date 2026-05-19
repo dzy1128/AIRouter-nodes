@@ -33,6 +33,31 @@ IMAGE_SIZE_OPTIONS = [
     "4K",
 ]
 
+SEEDREAM_SIZE_OPTIONS = [
+    "1024x1024",
+    "2048x2048",
+    "1728x2304",
+    "2304x1728",
+    "2848x1600",
+    "1600x2848",
+    "2496x1664",
+    "1664x2496",
+    "3136x1344",
+    "3072x3072",
+    "2592x3456",
+    "3456x2592",
+    "4096x2304",
+    "2304x4096",
+    "2496x3744",
+    "3744x2496",
+    "4704x2016",
+]
+
+SEQUENTIAL_IMAGE_GENERATION_OPTIONS = [
+    "disabled",
+    "auto",
+]
+
 
 def _placeholder_image(size: int = 512) -> torch.Tensor:
     return torch.zeros((1, size, size, 3), dtype=torch.float32)
@@ -230,6 +255,58 @@ def _validate_request_params(
         return "非法参数 base_url：不能为空。"
     if not (0 <= int(seed) <= 0xFFFFFFFFFFFFFFFF):
         return f"非法参数 seed：{seed}，范围应为 0 到 18446744073709551615。"
+    if input_image_count < 0 or input_image_count > 5:
+        return f"非法参数 输入图片数量：{input_image_count}，允许范围为 0 到 5。"
+    return None
+
+
+def _is_valid_seedream_size(size: str) -> bool:
+    if not isinstance(size, str):
+        return False
+    match = re.match(r"^\s*(\d+)\s*[x\*]\s*(\d+)\s*$", size, re.IGNORECASE)
+    if not match:
+        return False
+    width, height = int(match.group(1)), int(match.group(2))
+    return 512 <= width <= 4096 and 512 <= height <= 4096
+
+
+def _validate_seedream_params(
+    *,
+    model: str,
+    size: str,
+    seed: int,
+    guidance_scale: float,
+    sequential_image_generation: str,
+    max_images: int,
+    response_format: str,
+    timeout_seconds: int,
+    base_url: str,
+    input_image_count: int,
+) -> Optional[str]:
+    if not model.strip():
+        return "非法参数 model：模型名不能为空。"
+    if not _is_valid_seedream_size(size):
+        return (
+            f"非法参数 size：{size}，应为类似 1024x1024 的格式，"
+            "且宽高均在 [512, 4096] 之间。"
+        )
+    if response_format.strip() not in ("url", "base64", "bytes", "json", ""):
+        return f"非法参数 response_format：{response_format}。"
+    if not (1.0 <= float(guidance_scale) <= 10.0):
+        return f"非法参数 guidance_scale：{guidance_scale}，范围应为 1.0 到 10.0。"
+    if not (10 <= int(timeout_seconds) <= 600):
+        return f"非法参数 timeout_seconds：{timeout_seconds}，范围应为 10 到 600。"
+    if not base_url.strip():
+        return "非法参数 base_url：不能为空。"
+    if not (-1 <= int(seed) <= 2147483647):
+        return f"非法参数 seed：{seed}，范围应为 -1 到 2147483647。"
+    if sequential_image_generation not in SEQUENTIAL_IMAGE_GENERATION_OPTIONS:
+        return (
+            f"非法参数 sequential_image_generation：{sequential_image_generation}，"
+            f"可选值：{', '.join(SEQUENTIAL_IMAGE_GENERATION_OPTIONS)}。"
+        )
+    if not (1 <= int(max_images) <= 15):
+        return f"非法参数 max_images：{max_images}，范围应为 1 到 15。"
     if input_image_count < 0 or input_image_count > 5:
         return f"非法参数 输入图片数量：{input_image_count}，允许范围为 0 到 5。"
     return None
@@ -621,19 +698,10 @@ class AIRouterImageBase:
         self,
         *,
         model: str,
-        prompt: str,
-        aspect_ratio: str,
-        image_size: str,
-        response_format: str,
-        seed: int,
         input_image_count: int,
         api_seconds: float,
         decode_seconds: float,
         output_count: int,
-        output_resolution: Optional[str],
-        texts: Sequence[str],
-        response_summary: Optional[Sequence[str]] = None,
-        response_body: Optional[str] = None,
         error: Optional[str] = None,
     ) -> str:
         lines = [
@@ -680,17 +748,10 @@ class AIRouterImageBase:
         if not prompt.strip() and not input_images:
             log = self._format_log(
                 model=model,
-                prompt=prompt,
-                aspect_ratio=aspect_ratio,
-                image_size=image_size,
-                response_format=response_format,
-                seed=seed,
                 input_image_count=0,
                 api_seconds=0.0,
                 decode_seconds=0.0,
                 output_count=0,
-                output_resolution=None,
-                texts=[],
                 error="请至少提供提示词或一张输入图片。",
             )
             return _placeholder_image(), log
@@ -711,19 +772,10 @@ class AIRouterImageBase:
         if validation_error:
             log = self._format_log(
                 model=model,
-                prompt=prompt,
-                aspect_ratio=aspect_ratio,
-                image_size=image_size,
-                response_format=response_format,
-                seed=seed,
                 input_image_count=len(input_images),
                 api_seconds=0.0,
                 decode_seconds=0.0,
                 output_count=0,
-                output_resolution=None,
-                texts=[],
-                response_summary=None,
-                response_body=None,
                 error=validation_error,
             )
             return _placeholder_image(), log
@@ -775,57 +827,34 @@ class AIRouterImageBase:
                 data_items=data_items,
                 timeout_seconds=timeout_seconds,
             )
-            texts = _extract_texts(response_payload)
 
             if not tensors:
                 log = self._format_log(
                     model=model,
-                    prompt=prompt,
-                    aspect_ratio=aspect_ratio,
-                    image_size=image_size,
-                    response_format=response_format,
-                    seed=seed,
                     input_image_count=len(input_images),
                     api_seconds=api_seconds,
                     decode_seconds=decode_seconds,
                     output_count=0,
-                    output_resolution=None,
-                    texts=texts,
                     error="接口没有返回可解析的图片数据。",
                 )
                 return _placeholder_image(), log
 
             batch = torch.cat(tensors, dim=0)
-            height, width = batch.shape[1], batch.shape[2]
             log = self._format_log(
                 model=model,
-                prompt=prompt,
-                aspect_ratio=aspect_ratio,
-                image_size=image_size,
-                response_format=response_format,
-                seed=seed,
                 input_image_count=len(input_images),
                 api_seconds=api_seconds,
                 decode_seconds=decode_seconds,
                 output_count=batch.shape[0],
-                output_resolution=f"{width}x{height}",
-                texts=texts,
             )
             return batch, log
         except Exception as exc:
             log = self._format_log(
                 model=model,
-                prompt=prompt,
-                aspect_ratio=aspect_ratio,
-                image_size=image_size,
-                response_format=response_format,
-                seed=seed,
                 input_image_count=len(input_images),
                 api_seconds=0.0,
                 decode_seconds=0.0,
                 output_count=0,
-                output_resolution=None,
-                texts=[],
                 error=str(exc),
             )
             return _placeholder_image(), log
@@ -838,6 +867,259 @@ class AIRouterSeedreamImageNode(AIRouterImageBase):
         "seedream-5.0-lite",
     ]
     DEFAULT_MODEL = "doubao-seedream-5-0-260128"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        default_model = (
+            cls.DEFAULT_MODEL
+            if cls.MODEL_OPTIONS and cls.DEFAULT_MODEL in cls.MODEL_OPTIONS
+            else (cls.MODEL_OPTIONS[0] if cls.MODEL_OPTIONS else cls.DEFAULT_MODEL)
+        )
+        return {
+            "required": {
+                "prompt": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "placeholder": "输入提示词。图生图时可以留空，但建议配合提示词使用。",
+                    },
+                ),
+                "model": (
+                    list(cls.MODEL_OPTIONS),
+                    {"default": default_model},
+                ),
+                "size": (
+                    SEEDREAM_SIZE_OPTIONS,
+                    {"default": "2048x2048"},
+                ),
+                "guidance_scale": (
+                    "FLOAT",
+                    {
+                        "default": 2.5,
+                        "min": 1.0,
+                        "max": 10.0,
+                        "step": 0.1,
+                    },
+                ),
+                "watermark": (
+                    "BOOLEAN",
+                    {"default": True},
+                ),
+                "sequential_image_generation": (
+                    SEQUENTIAL_IMAGE_GENERATION_OPTIONS,
+                    {"default": "disabled"},
+                ),
+                "max_images": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "max": 15,
+                        "step": 1,
+                    },
+                ),
+                "response_format": (
+                    "STRING",
+                    {
+                        "default": "url",
+                        "multiline": False,
+                    },
+                ),
+                "timeout_seconds": (
+                    "INT",
+                    {
+                        "default": 180,
+                        "min": 10,
+                        "max": 600,
+                        "step": 1,
+                    },
+                ),
+                "base_url": (
+                    "STRING",
+                    {
+                        "default": "https://api-ai.gk.cn",
+                        "multiline": False,
+                    },
+                ),
+                "seed": (
+                    "INT",
+                    {
+                        "default": -1,
+                        "min": -1,
+                        "max": 2147483647,
+                        "step": 1,
+                    },
+                ),
+            },
+            "optional": {
+                "image_1": ("IMAGE",),
+                "image_2": ("IMAGE",),
+                "image_3": ("IMAGE",),
+                "image_4": ("IMAGE",),
+                "image_5": ("IMAGE",),
+            },
+        }
+
+    def _build_seedream_payload(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        size: str,
+        seed: int,
+        guidance_scale: float,
+        watermark: bool,
+        sequential_image_generation: str,
+        max_images: int,
+        response_format: str,
+        input_images: Sequence[torch.Tensor],
+    ) -> Dict[str, Any]:
+        input_payload: Dict[str, Any] = {}
+        if prompt.strip():
+            input_payload["prompt"] = prompt.strip()
+        if input_images:
+            input_payload["images"] = [_tensor_to_data_url(image) for image in input_images]
+
+        parameters: Dict[str, Any] = {
+            "size": size,
+            "seed": int(seed),
+            "guidance_scale": float(guidance_scale),
+            "watermark": bool(watermark),
+            "sequential_image_generation": sequential_image_generation,
+        }
+        if sequential_image_generation == "auto":
+            parameters["sequential_image_generation_options"] = {
+                "max_images": int(max_images),
+            }
+
+        return {
+            "model": model.strip(),
+            "input": input_payload,
+            "parameters": parameters,
+            "format": response_format.strip(),
+        }
+
+    def generate(
+        self,
+        prompt: str,
+        model: str,
+        size: str,
+        guidance_scale: float,
+        watermark: bool,
+        sequential_image_generation: str,
+        max_images: int,
+        response_format: str,
+        timeout_seconds: int,
+        base_url: str,
+        seed: int,
+        image_1: Optional[torch.Tensor] = None,
+        image_2: Optional[torch.Tensor] = None,
+        image_3: Optional[torch.Tensor] = None,
+        image_4: Optional[torch.Tensor] = None,
+        image_5: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, str]:
+        input_images = [
+            image
+            for image in (image_1, image_2, image_3, image_4, image_5)
+            if image is not None
+        ]
+
+        if not prompt.strip() and not input_images:
+            log = self._format_log(
+                model=model,
+                input_image_count=0,
+                api_seconds=0.0,
+                decode_seconds=0.0,
+                output_count=0,
+                error="请至少提供提示词或一张输入图片。",
+            )
+            return _placeholder_image(), log
+
+        validation_error = _validate_seedream_params(
+            model=model,
+            size=size,
+            seed=seed,
+            guidance_scale=guidance_scale,
+            sequential_image_generation=sequential_image_generation,
+            max_images=max_images,
+            response_format=response_format,
+            timeout_seconds=timeout_seconds,
+            base_url=base_url,
+            input_image_count=len(input_images),
+        )
+        if validation_error:
+            log = self._format_log(
+                model=model,
+                input_image_count=len(input_images),
+                api_seconds=0.0,
+                decode_seconds=0.0,
+                output_count=0,
+                error=validation_error,
+            )
+            return _placeholder_image(), log
+
+        try:
+            payload = self._build_seedream_payload(
+                prompt=prompt,
+                model=model,
+                size=size,
+                seed=seed,
+                guidance_scale=guidance_scale,
+                watermark=watermark,
+                sequential_image_generation=sequential_image_generation,
+                max_images=max_images,
+                response_format=response_format,
+                input_images=input_images,
+            )
+            response_payload, api_seconds = self._request_images(
+                payload=payload,
+                base_url=base_url,
+                timeout_seconds=timeout_seconds,
+            )
+
+            data_items = _collect_image_items(response_payload)
+            normalized_data_items = _normalize_data_items(response_payload)
+            if normalized_data_items:
+                data_items = normalized_data_items + [
+                    item for item in data_items if item not in normalized_data_items
+                ]
+
+            tensors, decode_seconds = self._decode_images(
+                data_items=data_items,
+                timeout_seconds=timeout_seconds,
+            )
+
+            if not tensors:
+                log = self._format_log(
+                    model=model,
+                    input_image_count=len(input_images),
+                    api_seconds=api_seconds,
+                    decode_seconds=decode_seconds,
+                    output_count=0,
+                    error="接口没有返回可解析的图片数据。",
+                )
+                return _placeholder_image(), log
+
+            batch = torch.cat(tensors, dim=0)
+            log = self._format_log(
+                model=model,
+                input_image_count=len(input_images),
+                api_seconds=api_seconds,
+                decode_seconds=decode_seconds,
+                output_count=batch.shape[0],
+            )
+            return batch, log
+        except Exception as exc:
+            log = self._format_log(
+                model=model,
+                input_image_count=len(input_images),
+                api_seconds=0.0,
+                decode_seconds=0.0,
+                output_count=0,
+                error=str(exc),
+            )
+            return _placeholder_image(), log
 
 
 class AIRouterGeminiImageNode(AIRouterImageBase):
