@@ -258,7 +258,7 @@ def _validate_request_params(
         return f"非法参数 aspect_ratio：{aspect_ratio}，可选值：{', '.join(ASPECT_RATIO_OPTIONS)}。"
     if image_size not in IMAGE_SIZE_OPTIONS:
         return f"非法参数 image_size：{image_size}，可选值：{', '.join(IMAGE_SIZE_OPTIONS)}。"
-    if response_format.strip() not in ("url", "base64", "bytes", "json", ""):
+    if response_format.strip() not in ("url", "base64", "bytes", "json", "b64_json", ""):
         return f"非法参数 response_format：{response_format}。"
     if not (0.0 <= float(temperature) <= 2.0):
         return f"非法参数 temperature：{temperature}，范围应为 0.0 到 2.0。"
@@ -306,7 +306,7 @@ def _validate_seedream_params(
             f"非法参数 size：{size}，应为类似 1024x1024 的格式，"
             "且宽高均在 [512, 4096] 之间。"
         )
-    if response_format.strip() not in ("url", "base64", "bytes", "json", ""):
+    if response_format.strip() not in ("url", "base64", "bytes", "json", "b64_json", ""):
         return f"非法参数 response_format：{response_format}。"
     if not (10 <= int(timeout_seconds) <= 600):
         return f"非法参数 timeout_seconds：{timeout_seconds}，范围应为 10 到 600。"
